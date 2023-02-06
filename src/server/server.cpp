@@ -1,3 +1,4 @@
+#include <shared_adapter.h>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -9,80 +10,77 @@
 #include <thread>
 #include <string>
 #include <iostream>
+#include <atomic>
 
 const int adapter_payload_size = 37;
+std::atomic<bool> stop{false};
 
-struct controller_payload_region
+struct adapters *adapters;
+
+struct adapter
 {
-	std::chrono::high_resolution_clock::time_point start;
-	std::chrono::high_resolution_clock::time_point now;
-	bool error;
-    int payload_size;
-	unsigned char controller_payload[adapter_payload_size];
+    // int fd;
+    uint16_t index;
+    uint16_t unique_num;
+    libusb_device_handle *handle;
+    struct payload_region *payload;
 };
 
-int main() {
-    printf("Init\n");
+int initialize_adapter(libusb_device *device, struct adapter *adapter) {
     int r;
-    libusb_device_handle *handle;
+    // uint8_t endpoint_address = 129;
+    // Endpoint address for which you want to get the max packet size0
+
+    r = libusb_open(device, &(adapter->handle));
+    if (r < 0) {
+        std::cerr << "Error opening device: " << libusb_error_name(r) << std::endl;
+        return r;
+    }
+
+    // Get adapter shared memory
+    adapter->payload = (payload_region *)get_adapter_by_unique_num(adapter->unique_num);
+
+    r = libusb_detach_kernel_driver(adapter->handle,0);
+    r = libusb_claim_interface(adapter->handle, 0);
+    if (r) {
+        std::cerr << "Error claiming device: " << libusb_error_name(r) << std::endl;
+        return r;
+    }
+    r = libusb_control_transfer(adapter->handle, 0x21, 11, 0x0001, 0, NULL, 0, 1000);
+    if (r) {
+        std::cerr << "Error control device: " << libusb_error_name(r) << std::endl;
+        return r;
+    }
+    int tmp = 0;
+	unsigned char payload = 0x13;
+	r = libusb_interrupt_transfer(adapter->handle, 2, &payload, sizeof(payload), &tmp, 32);
+    if (r) {
+        std::cerr << "Error on initial interrupt transfer: " << libusb_error_name(r) << std::endl;
+        return r;
+    }
+    return 0;
+}
+
+void adapter_func(libusb_device *device, int index) {
+    struct adapter adapter;
+
+    uint8_t bus = libusb_get_bus_number(device);
+    uint8_t dev_addr = libusb_get_device_address(device);
+    adapter.unique_num = bus + (dev_addr << 8 );
+    adapter.index = index;
 
     unsigned char previous_payload[adapter_payload_size];
     unsigned char current_payload[adapter_payload_size];
     int current_payload_size = 0;
     int previous_payload_size = 0;
 
+    initialize_adapter(device, &adapter);
 
-    struct controller_payload_region *shared_controller_payload_region;
-    // Shared memory init
-    int shared_mem_fd = shm_open("/gcadapter", O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
-    if (shared_mem_fd== -1) {
-        // error
-        printf("Shared memory error");
-        return -1;
-    }
-
-    if (ftruncate(shared_mem_fd, adapter_payload_size)== -1){
-        // error
-        printf("truncate memory error");
-        return -1;
-    }
-
-    shared_controller_payload_region = (struct controller_payload_region*)mmap(NULL, adapter_payload_size, PROT_READ | PROT_WRITE, MAP_SHARED, shared_mem_fd, 0);
-    if (shared_controller_payload_region == MAP_FAILED){
-        // error
-        printf("map memory error");
-        return -1;
-    }
-
-    printf("Map addr is %6.6X\n", shared_controller_payload_region);
-
-    printf("libusb Init\n");
-    r = libusb_init(NULL);
-    if (r) {
-        printf("libusb init error: %s\n", libusb_error_name(r));
-    }
-
-    printf("Libusb open device\n");
-    handle = libusb_open_device_with_vid_pid(NULL, 0x057e, 0x0337);
-
-    printf("libusb claim interface\n");
-    r = libusb_detach_kernel_driver(handle,0);
-    r = libusb_claim_interface(handle, 0);
-    if (r) {
-        printf("libusb claim error: %s\n", libusb_error_name(r));
-    }
-    r = libusb_control_transfer(handle, 0x21, 11, 0x0001, 0, NULL, 0, 1000);
-    if (r) {
-        printf("libusb control error: %s\n", libusb_error_name(r));
-    }
-    int tmp = 0;
-	unsigned char payload = 0x13;
-	libusb_interrupt_transfer(handle, 2, &payload, sizeof(payload), &tmp, 32);
-
-    while (1) {
-		std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        r = libusb_interrupt_transfer(handle, 129, current_payload, adapter_payload_size, &current_payload_size, 32);
-		std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
+    while (!stop)
+    {
+        std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
+        int r = libusb_interrupt_transfer(adapter.handle, 129, current_payload, adapter_payload_size, &current_payload_size, 32);
+        std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
         if (r) {
             // printf("libusb interrupt error: %s\n", libusb_error_name(r));
             memcpy(current_payload,previous_payload,adapter_payload_size);
@@ -92,15 +90,73 @@ int main() {
             memcpy(previous_payload,current_payload,adapter_payload_size);
             previous_payload_size = current_payload_size;
         }
-        shared_controller_payload_region->start = start;
-        memcpy(shared_controller_payload_region->controller_payload,current_payload,adapter_payload_size);
-        shared_controller_payload_region->error = r;
-        shared_controller_payload_region->payload_size = current_payload_size;
-        shared_controller_payload_region->start = now;
-        
-        // printf("\n");
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        adapter.payload->start = start;
+        memcpy(adapter.payload->controller_payload,current_payload,adapter_payload_size);
+        adapter.payload->error = r;
+        adapter.payload->payload_size = current_payload_size;
+        adapter.payload->start = now;
     }
-    printf("libusb close\n");
-    libusb_close(handle);
+    
+}
+
+int main() {
+
+    // TODO: method to identify multiple adapters
+    
+    // Get list of lib_usb with pid and vid
+    printf("Init\n");
+    libusb_context *context = NULL;
+    int result = libusb_init(&context);
+    if (result < 0) {
+        std::cerr << "Error initializing libusb: " << libusb_error_name(result) << std::endl;
+        return 1;
+    }
+
+    libusb_device **list;
+    ssize_t count = libusb_get_device_list(context, &list);
+    if (count < 0) {
+        std::cerr << "Error getting device list: " << libusb_error_name(count) << std::endl;
+        libusb_exit(context);
+        return 1;
+    }
+
+
+    uint16_t vendor_id = 0x057e;  // Replace with desired vendor ID
+    uint16_t product_id = 0x0337;  // Replace with desired product ID
+    int fd;
+    adapters = (struct adapters *)get_shared_memory(&fd,"/gcadapters", sizeof(struct adapters));
+    adapters->count = 0;
+    for (ssize_t i = 0; i < count; ++i) {
+        libusb_device *device = list[i];
+        libusb_device_descriptor desc;
+        result = libusb_get_device_descriptor(device, &desc);
+        if (result < 0) {
+            std::cerr << "Error getting device descriptor: " << libusb_error_name(result) << std::endl;
+            continue;
+        }
+
+        if (desc.idVendor == vendor_id && desc.idProduct == product_id) {
+
+            uint8_t bus = libusb_get_bus_number(device);
+            uint8_t dev_addr = libusb_get_device_address(device);
+            adapters->unique_num[adapters->count] = bus + (dev_addr << 8 );
+            adapters->status[adapters->count] = 0b00000000;
+
+            std::cout << "Found Gamecube Adapter #" << bus + (dev_addr << 8 ) << std::endl;
+            // std::cout << ;
+            std::thread adapter_thread(adapter_func, device, adapters->count);
+            adapter_thread.detach();
+
+            adapters->count++;
+        }
+    }
+
+    while(1) {
+        sleep(1);
+    }
+    libusb_free_device_list(list, 1);
+    
+    libusb_exit(context);
+
+    return 0;
 }
